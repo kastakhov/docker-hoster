@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 import docker
 import argparse
 import shutil
@@ -6,141 +6,167 @@ import signal
 import time
 import sys
 import os
+import json
+import logging
 
-label_name = "hoster.domains"
-enclosing_pattern = "#-----------Docker-Hoster-Domains----------\n"
+enclosing_pattern = "#-----------Docker-Hoster-Domains-----------"
+hosts_footer = "#-----------Do-not-add-hosts-after-this-line-----------"
+
 hosts_path = "/tmp/hosts"
 hosts = {}
 
+start_actions = ["start"]
+stop_actions = ["stop","die","destroy","kill"]
+rename_actions = ["rename"]
+
+logging.basicConfig(
+  level=logging.INFO,
+  format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 def signal_handler(signal, frame):
-    global hosts
-    hosts = {}
-    update_hosts_file()
-    sys.exit(0)
+  global hosts
+  logger.info("Received signal to exit, cleaning up...")
+  hosts = {}
+  update_hosts_file()
+  sys.exit(0)
 
 def main():
-    # register the exit signals
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+  # register the exit signals
+  signal.signal(signal.SIGINT, signal_handler)
+  signal.signal(signal.SIGTERM, signal_handler)
 
-    args = parse_args()
-    global hosts_path
-    hosts_path = args.file
+  args = parse_args()
+  global hosts_path
+  hosts_path = args.file
 
+  try:
     dockerClient = docker.APIClient(base_url='unix://%s' % args.socket)
-    events = dockerClient.events(decode=True)
-    #get running containers
-    for c in dockerClient.containers(quiet=True, all=False):
-        container_id = c["Id"]
-        container = get_container_data(dockerClient, container_id)
-        hosts[container_id] = container
+    logger.info(f"Connected to docker socket at {args.socket}")
+  except Exception as e:
+    logger.error(f"Failed to connect to docker socket at {args.socket}: {e}")
+    sys.exit(1)
 
-    update_hosts_file()
+  #get running containers
+  for c in dockerClient.containers(quiet=True, all=False):
+    container_id = c["Id"]
+    hosts[container_id] = get_container_data(dockerClient, container_id)
 
-    #listen for events to keep the hosts file updated
-    for e in events:
-        if e["Type"]!="container": 
-            continue
-        
-        status = e["status"]
-        if status =="start":
-            container_id = e["id"]
-            container = get_container_data(dockerClient, container_id)
-            hosts[container_id] = container
-            update_hosts_file()
+  update_hosts_file()
 
-        if status=="stop" or status=="die" or status=="destroy":
-            container_id = e["id"]
-            if container_id in hosts:
-                hosts.pop(container_id)
-                update_hosts_file()
+  #listen for events to keep the hosts file updated
+  events = dockerClient.events(decode=True)
+  for e in events:
+    logger.debug(f"Event received: {json.dumps(e)}")
+    if e["Type"] != "container":
+      continue
 
-        if status=="rename":
-            container_id = e["id"]
-            if container_id in hosts:
-                container = get_container_data(dockerClient, container_id)
-                hosts[container_id] = container
-                update_hosts_file()
+    action = e.get("Action")
+    container_id = e.get("Actor", {}).get("ID")
+
+    if not container_id or not action:
+      logger.warning(f"Could not parse container ID or action from event: {json.dumps(e)}")
+      continue
+
+    if action in start_actions:
+      logger.info(f"Container started, adding/updating hosts entry for container ID {container_id}")
+      hosts[container_id] = get_container_data(dockerClient, container_id)
+      update_hosts_file()
+
+    if action in stop_actions:
+      if container_id in hosts:
+        logger.info(f"Container stopped/removed, removing hosts entry for container ID {container_id}")
+        hosts.pop(container_id)
+        update_hosts_file()
+
+    if action in rename_actions:
+      if container_id in hosts:
+        logger.info(f"Container renamed, updating hosts entry for container ID {container_id}")
+        hosts[container_id] = get_container_data(dockerClient, container_id)
+        update_hosts_file()
 
 
 def get_container_data(dockerClient, container_id):
-    #extract all the info with the docker api
-    info = dockerClient.inspect_container(container_id)
-    container_hostname = info["Config"]["Hostname"]
-    container_name = info["Name"].strip("/")
-    container_ip = info["NetworkSettings"]["IPAddress"]
-    if info["Config"]["Domainname"]:
-        container_hostname = container_hostname + "." + info["Config"]["Domainname"]
-    
-    result = []
+  result = []
+  #extract all the info with the docker api
+  info = dockerClient.inspect_container(container_id)
+  logger.debug(f"Container info: {json.dumps(info)}")
 
-    for values in info["NetworkSettings"]["Networks"].values():
-        
-        if not values["Aliases"]: 
-            continue
+  container_name = info["Name"].strip("/")
+  container_hostname = info["Config"].get("Hostname")
+  container_domainname = info["Config"].get("Domainname")
 
-        result.append({
-                "ip": values["IPAddress"] , 
-                "name": container_name,
-                "domains": set(values["Aliases"] + [container_name, container_hostname])
-            })
+  if container_domainname:
+    container_hostname = container_hostname + "." + container_domainname
 
-    if container_ip:
-        result.append({"ip": container_ip, "name": container_name, "domains": [container_name, container_hostname ]})
+  domains = [container_name, container_hostname]
 
-    return result
+  for values in info["NetworkSettings"]["Networks"].values():
+    if values.get("Aliases"):
+      domains.extend(values["Aliases"])
+
+    result.append(
+      {
+        "ip": values["IPAddress"],
+        "name": container_name,
+        "domains": set(domains)
+      }
+    )
+
+  return result
 
 
 def update_hosts_file():
-    if len(hosts)==0:
-        print("Removing all hosts before exit...")
-    else:
-        print("Updating hosts file with:")
+  lines_to_add = []
+  if not hosts:
+    logger.info("No docker containers are found, clearing hosts file entries.")
+  else:
+    logger.info("Rewriting hosts file with:")
+    for host in hosts.values():
+      for network in host:
+        logger.info(" * container name: '%s', ip: '%s', domains: %s" % (network["name"], network["ip"], network["domains"]))
+        lines_to_add.append("%s\t%s # %s\n"%(network["ip"]," ".join(network["domains"]), network["name"]))
 
-    for id,addresses in hosts.items():
-        for addr in addresses:
-            print("ip: %s domains: %s" % (addr["ip"], addr["domains"]))
+  #read all the lines of thge original file
+  lines = []
+  with open(hosts_path,"r+") as hosts_file:
+    lines = hosts_file.readlines()
 
-    #read all the lines of thge original file
-    lines = []
-    with open(hosts_path,"r+") as hosts_file:
-        lines = hosts_file.readlines()
+  #remove all the lines after the known pattern
+  for i, line in enumerate(lines):
+    if line == enclosing_pattern:
+      lines = lines[:i]
+      break
 
-    #remove all the lines after the known pattern
-    for i,line in enumerate(lines):
-        if line==enclosing_pattern:
-            lines = lines[:i]
-            break;
+  #remove all the trailing newlines on the line list
+  if lines:
+    while lines[-1].strip() == "": lines.pop()
 
-    #remove all the trailing newlines on the line list
-    if lines:
-        while lines[-1].strip()=="": lines.pop()
+  #append all the domain lines
+  if hosts:
+    lines.append("\n\n" + enclosing_pattern)
 
-    #append all the domain lines
-    if len(hosts)>0:
-        lines.append("\n\n"+enclosing_pattern)
-        
-        for id, addresses in hosts.items():
-            for addr in addresses:
-                lines.append("%s    %s\n"%(addr["ip"],"   ".join(addr["domains"])))
-        
-        lines.append("#-----Do-not-add-hosts-after-this-line-----\n\n")
+    for line in lines_to_add:
+      lines.append(line)
 
-    #write it on the auxiliar file
-    aux_file_path = hosts_path+".aux"
-    with open(aux_file_path,"w") as aux_hosts:
-        aux_hosts.writelines(lines)
+    lines.append(hosts_footer + "\n")
 
-    #replace etc/hosts with aux file, making it atomic
-    shutil.move(aux_file_path, hosts_path)
+  #write it on the auxiliar file
+  aux_file_path = hosts_path+".aux"
+  with open(aux_file_path,"w") as aux_hosts:
+    aux_hosts.writelines(lines)
+
+  #replace etc/hosts with aux file, making it atomic
+  shutil.move(aux_file_path, hosts_path)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Synchronize running docker container IPs with host /etc/hosts file.')
-    parser.add_argument('socket', type=str, nargs="?", default="tmp/docker.sock", help='The docker socket to listen for docker events.')
-    parser.add_argument('file', type=str, nargs="?", default="/tmp/hosts", help='The /etc/hosts file to sync the containers with.')
-    return parser.parse_args()
+  parser = argparse.ArgumentParser(description='Synchronize running docker container IPs with host /etc/hosts file.')
+  parser.add_argument('socket', type=str, nargs="?", default="tmp/docker.sock", help='The docker socket to listen for docker events.')
+  parser.add_argument('file', type=str, nargs="?", default="/tmp/hosts", help='The /etc/hosts file to sync the containers with.')
+  return parser.parse_args()
+
 
 if __name__ == '__main__':
-    main()
-
+  main()
